@@ -4,14 +4,18 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.gl.blending.BlendModeStorage;
 import net.irisshaders.iris.gl.blending.DepthColorStorage;
+import net.irisshaders.iris.pipeline.IrisRenderingPipeline;
+import net.irisshaders.iris.pipeline.ShaderRenderingPipeline;
 import net.irisshaders.iris.pipeline.PipelineManager;
 import net.irisshaders.iris.pipeline.VanillaRenderingPipeline;
 import net.irisshaders.iris.pipeline.WorldRenderingPipeline;
 import net.irisshaders.iris.shaderpack.materialmap.WorldRenderingSettings;
 import net.irisshaders.iris.shadows.ShadowRenderer;
+import net.irisshaders.iris.targets.RenderTargets;
 import net.irisshaders.iris.uniforms.CapturedRenderingState;
 import net.irisshaders.iris.vertices.ImmediateState;
 import net.mehvahdjukaar.moonlight.api.platform.configs.ConfigBuilder;
+import net.mehvahdjukaar.vista.integration.CompatHandler;
 import net.mehvahdjukaar.vista.VistaMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.LevelRenderer;
@@ -19,13 +23,18 @@ import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.joml.Vector3d;
+import org.lwjgl.opengl.ARBClearTexture;
+import org.lwjgl.opengl.GL11;
 
-import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 public class IrisCompat {
@@ -45,6 +54,13 @@ public class IrisCompat {
 
     public static boolean isFeedRendering() {
         return VISTA_RENDERING.get();
+    }
+
+    // Whether an Iris shaderpack pipeline is currently driving world rendering. Used to gate the
+    // custom CRT screen shader, which is not safe under an active pack.
+    public static boolean hasActiveShaderPack() {
+        return CompatHandler.IRIS
+                && Iris.getPipelineManager().getPipelineNullable() instanceof ShaderRenderingPipeline;
     }
 
     // A bare static Iris flips at the head and return of renderLevel, so nesting a second one inside
@@ -86,33 +102,151 @@ public class IrisCompat {
     // Iris detects a recreated render target through version counters that only increment in
     // destroyBuffers, so a brand new RenderTarget starts at 0 just like the old one did. Resizing a TV
     // swaps in exactly that, and Iris keeps its gbuffers on the old (possibly freed) depth texture.
-    // Bumping on every canvas change makes the next beginLevelRendering re-attach.
-    private static WeakReference<RenderTarget> lastFeedCanvas = new WeakReference<>(null);
+    //
+    // Feed pipelines can be shared by same-size canvases, so the bump has to happen on EVERY feed
+    // render (not only when the canvas instance changes) and has to be globally monotonic. A plain
+    // +1 gives two freshly created canvases the same version (1), and the pipeline then skips the
+    // depth re-attach for the second canvas, leaving its depth/gbuffer attachments pointing at the
+    // first TV's buffers -- one TV's picture then bleeds into the other until the pipeline is
+    // reloaded.
+    private static final AtomicInteger FEED_CANVAS_VERSION = new AtomicInteger(0);
 
-    public static void onFeedCanvasBound(RenderTarget canvas) {
-        if (lastFeedCanvas.get() == canvas) return;
-        lastFeedCanvas = new WeakReference<>(canvas);
+    public static void onFeedCanvasBound(RenderTarget canvas, String texturePath) {
+        CURRENT_FEED_TEXTURE.set(texturePath);
         bumpIrisVersionCounters(canvas);
     }
 
     private static void bumpIrisVersionCounters(RenderTarget canvas) {
         if (DEPTH_BUFFER_VERSION_FIELD == null && COLOR_BUFFER_VERSION_FIELD == null) return;
+        int version = FEED_CANVAS_VERSION.updateAndGet(v -> v == Integer.MAX_VALUE ? 1 : v + 1);
         try {
             if (DEPTH_BUFFER_VERSION_FIELD != null) {
-                DEPTH_BUFFER_VERSION_FIELD.setInt(canvas, DEPTH_BUFFER_VERSION_FIELD.getInt(canvas) + 1);
+                DEPTH_BUFFER_VERSION_FIELD.setInt(canvas, version);
             }
             if (COLOR_BUFFER_VERSION_FIELD != null) {
-                COLOR_BUFFER_VERSION_FIELD.setInt(canvas, COLOR_BUFFER_VERSION_FIELD.getInt(canvas) + 1);
+                COLOR_BUFFER_VERSION_FIELD.setInt(canvas, version);
             }
         } catch (IllegalAccessException e) {
             VistaMod.LOGGER.warn("Failed to bump Iris render-target version counters", e);
         }
     }
 
+    // The dimension key the feed pass renders under. One pipeline per canvas (TV texture) keeps
+    // each camera's temporal buffers (TAA history, SSR, ...) isolated. Same-size TVs sharing one
+    // pipeline alternate canvases every render and each composite blends the other camera's previous
+    // frame into its own -- the cross-camera ghosting this whole file is trying to avoid. Pipeline
+    // creation is expensive, so the number of issued per-canvas keys is capped; past the cap feeds
+    // fall back to sharing a pipeline per canvas size, which is handled by onFeedPipelineBound's
+    // full clear below.
+    public static final int MAX_FEED_PIPELINES = 6;
+    private static final Set<String> ISSUED_FEED_KEYS = new HashSet<>();
+
     @Nullable
-    private static Field lookupIrisRtField(String name) {
+    public static String feedPipelineKey() {
+        String texturePath = CURRENT_FEED_TEXTURE.get();
+        if (texturePath == null) return null;
+        if (ISSUED_FEED_KEYS.contains(texturePath)) return texturePath;
+        if (ISSUED_FEED_KEYS.size() >= MAX_FEED_PIPELINES) {
+            // "<w>x<h>": the shared per-size key used before canvas isolation.
+            return texturePath.substring(texturePath.lastIndexOf('_') + 1);
+        }
+        ISSUED_FEED_KEYS.add(texturePath);
+        return texturePath;
+    }
+
+    // A shared per-size pipeline still alternates between same-size canvases when more than
+    // MAX_FEED_PIPELINES are in view. Its colortex ping-pong buffers hold the pack's temporal state
+    // and are view dependent. Arming Iris's full-clear flag on a canvas switch makes the next
+    // beginLevelRendering clear both halves of every temporal buffer, which is far less visible than
+    // cross-camera ghosting.
+    public static void onFeedPipelineBound(WorldRenderingPipeline pipeline, RenderTarget canvas) {
+        RenderTarget last = LAST_FEED_CANVAS.put(pipeline, canvas);
+        if (last != null && last != canvas) {
+            VistaMod.LOGGER.info("[VistaFeed] pipeline canvas switch #{} -> #{}: arming full clear",
+                    System.identityHashCode(last), System.identityHashCode(canvas));
+            clearTemporalBuffers(pipeline);
+        }
+        // The feed renders at 10Hz by default, so between two frames a moving entity jumps by a
+        // large pixel distance. BSL/Bliss TAA has no per-entity motion vectors; it reprojects only
+        // the camera, so its neighbourhood clamp cannot reject that jump and the TAA history
+        // (colortex5, never cleared by the pack) smears every previous position into the current
+        // frame: moving entities look like a long-exposure photograph. Clearing colortex5 before
+        // each feed render turns the temporal pass into a single-sample resolve -- no trails, at
+        // the cost of some shimmer at low feed FPS. A newly created pipeline already has its
+        // full-clear flag set, so clearing here only matters for cached pipelines.
+        clearTaaHistory(pipeline);
+    }
+
+    // Main render thread only, keyed weakly so pipelines destroyed on a pack reload don't leak.
+    private static final Map<WorldRenderingPipeline, RenderTarget> LAST_FEED_CANVAS = new WeakHashMap<>();
+
+    private static void clearTemporalBuffers(WorldRenderingPipeline pipeline) {
+        // Toggling shaderpacks off mid-session makes preparePipeline hand back a bare
+        // VanillaRenderingPipeline for the feed dimension, which has no renderTargets field.
+        if (!(pipeline instanceof IrisRenderingPipeline)) return;
+        if (PIPELINE_RENDER_TARGETS_FIELD == null || FULL_CLEAR_REQUIRED_FIELD == null) return;
         try {
-            Field f = RenderTarget.class.getDeclaredField(name);
+            Object renderTargets = PIPELINE_RENDER_TARGETS_FIELD.get(pipeline);
+            if (renderTargets != null) {
+                FULL_CLEAR_REQUIRED_FIELD.setBoolean(renderTargets, true);
+            }
+        } catch (ReflectiveOperationException e) {
+            VistaMod.LOGGER.warn("Failed to arm Iris full clear for feed pipeline switch", e);
+        }
+    }
+
+    // BSL/Bliss keep their TAA history in colortex5 and deliberately never clear it
+    // (colortex5Clear=false). We clear only that ping-pong pair before every feed render; a full
+    // clear would also wipe the pack's gbuffers (colortex1 clears to white) and can wash the
+    // composite out, which is why the canvas-switch full clear above is only armed on switches.
+    private static void clearTaaHistory(WorldRenderingPipeline pipeline) {
+        if (!(pipeline instanceof IrisRenderingPipeline)) return;
+        if (PIPELINE_RENDER_TARGETS_FIELD == null) return;
+        try {
+            Object renderTargets = PIPELINE_RENDER_TARGETS_FIELD.get(pipeline);
+            if (renderTargets == null) return;
+            Object taaTarget = renderTargets.getClass().getMethod("get", int.class).invoke(renderTargets, 5);
+            if (taaTarget == null) return;
+            clearIrisTexture(taaTarget, "getMainTexture");
+            clearIrisTexture(taaTarget, "getAltTexture");
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            VistaMod.LOGGER.warn("Failed to clear Iris TAA history for feed", e);
+        }
+    }
+
+    private static void clearIrisTexture(Object irisRenderTarget, String getterName)
+            throws ReflectiveOperationException {
+        int texture = (Integer) irisRenderTarget.getClass().getMethod(getterName).invoke(irisRenderTarget);
+        if (texture != 0) {
+            // data == null fills the texture with zeroes; format/type just describe the incoming
+            // data, so RGBA/UNSIGNED_BYTE is valid for the pack's float colour targets too.
+            ARBClearTexture.glClearTexImage(texture, 0, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, (int[]) null);
+        }
+    }
+
+    // The feed pipeline's first beginLevelRendering registers the pack's block-id map and is due
+    // to rebuild every section so meshes carry it. That rebuild is deferred out of the feed pass
+    // (tearing down the geometry being drawn wrecks it) and runs once the outermost feed finishes.
+    public static void scheduleWorldRebuild() {
+        PENDING_WORLD_REBUILD = true;
+    }
+
+    private static boolean PENDING_WORLD_REBUILD;
+
+    public static void runPendingWorldRebuild(boolean outermostFeedFinished) {
+        if (!outermostFeedFinished || !PENDING_WORLD_REBUILD) return;
+        PENDING_WORLD_REBUILD = false;
+        LevelRenderer levelRenderer = Minecraft.getInstance().levelRenderer;
+        if (levelRenderer != null) {
+            VistaMod.LOGGER.info("[VistaFeed] running deferred world rebuild for block id init");
+            levelRenderer.allChanged();
+        }
+    }
+
+    @Nullable
+    private static Field lookupField(Class<?> clazz, String name) {
+        try {
+            Field f = clazz.getDeclaredField(name);
             f.setAccessible(true);
             return f;
         } catch (NoSuchFieldException e) {
@@ -121,9 +255,15 @@ public class IrisCompat {
     }
 
     @Nullable
-    private static final Field DEPTH_BUFFER_VERSION_FIELD = lookupIrisRtField("iris$depthBufferVersion");
+    private static final Field DEPTH_BUFFER_VERSION_FIELD = lookupField(RenderTarget.class, "iris$depthBufferVersion");
     @Nullable
-    private static final Field COLOR_BUFFER_VERSION_FIELD = lookupIrisRtField("iris$colorBufferVersion");
+    private static final Field COLOR_BUFFER_VERSION_FIELD = lookupField(RenderTarget.class, "iris$colorBufferVersion");
+    // IrisRenderingPipeline.renderTargets and RenderTargets.fullClearRequired: arming the flag makes
+    // the next beginLevelRendering run its full clear passes over every colortex, history included.
+    @Nullable
+    private static final Field PIPELINE_RENDER_TARGETS_FIELD = lookupField(IrisRenderingPipeline.class, "renderTargets");
+    @Nullable
+    private static final Field FULL_CLEAR_REQUIRED_FIELD = lookupField(RenderTargets.class, "fullClearRequired");
 
     // VanillaRenderingPipeline's constructor is not inert: it rewrites WorldRenderingSettings as if a
     // pack had just unloaded, and each setter arms Iris's reload flag. It happens to land on untouched
@@ -172,6 +312,8 @@ public class IrisCompat {
         return VISTA_RENDERING.get() && !irisShaderPacksOff.get();
     }
 
+    private static final ThreadLocal<String> CURRENT_FEED_TEXTURE = new ThreadLocal<>();
+
     public static Runnable decorateRendererWithoutShaderPacks(Runnable renderTask) {
         return () -> {
             LevelRenderer lr = Minecraft.getInstance().levelRenderer;
@@ -200,6 +342,7 @@ public class IrisCompat {
                 oldState.saveTo(CapturedRenderingState.INSTANCE);
                 setCurrentPipeline(lr, oldLrPipeline);
                 setPipelineManagerPipeline(pm, oldPmPipeline);
+                runPendingWorldRebuild(!oldVistaRendering);
             }
         };
     }
@@ -266,10 +409,6 @@ public class IrisCompat {
         } catch (IllegalAccessException e) {
             throw new RuntimeException(e);
         }
-    }
-
-    public static boolean shouldSkipShadows() {
-        return VISTA_RENDERING.get();
     }
 
     public static boolean shouldSkipBobbing() {

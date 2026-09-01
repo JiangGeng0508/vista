@@ -1,11 +1,13 @@
 package net.mehvahdjukaar.vista.client.renderer;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.mehvahdjukaar.moonlight.api.misc.WeakHashSet;
 import net.mehvahdjukaar.moonlight.api.util.math.EntityAngles;
 import net.mehvahdjukaar.moonlight.core.client.DummyCamera;
+import net.mehvahdjukaar.vista.VistaMod;
 import net.mehvahdjukaar.vista.VistaPlatStuff;
 import net.mehvahdjukaar.vista.client.textures.MirrorReflectionTexture;
 import net.mehvahdjukaar.vista.client.textures.PerspectiveTexture;
@@ -36,7 +38,9 @@ import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
+import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL11C;
+import org.lwjgl.opengl.GL30;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -90,10 +94,14 @@ public class VistaLevelRenderer {
     }
 
     // Polygon offset layering doesn't take inside nested level renders, and z-fights under FAST
-    // graphics, so surface quads fall back to a manual forward offset in those cases.
+    // graphics, so surface quads fall back to a manual forward offset in those cases. Iris
+    // shaderpacks change the depth buffer format/precision, which beats the fixed polygon offset
+    // at coplanar distances: the screen quad intermittently loses to the block model's own screen
+    // face and the TV flashes dark.
     public static boolean needsManualSurfaceOffset() {
         if (isRenderingLiveFeed()) return true;
-        return Minecraft.getInstance().options.graphicsMode().get() == GraphicsStatus.FAST;
+        if (Minecraft.getInstance().options.graphicsMode().get() == GraphicsStatus.FAST) return true;
+        return CompatHandler.IRIS && IrisCompat.hasActiveShaderPack();
     }
 
     /**
@@ -213,6 +221,12 @@ public class VistaLevelRenderer {
         Minecraft mc = Minecraft.getInstance();
 
         if (mc.level == null) return;
+        // While Sodium's section build queue is busy (world join, teleport, new terrain), a feed
+        // render sees a half-built world: missing sections leave fog-colored holes and entities
+        // stamp ghost copies that the pack's temporal effects then persist. Skip refreshes until
+        // the queue drains, keeping the last good frame on the tv; the escape hatch keeps a tv in
+        // a permanently-busy area (flowing water etc.) from freezing forever.
+        if (shouldSkipFeedForBuildQueue()) return;
         //debounce dimension changing for some reason idk yet
         if (mc.level.dimension() != lastLevel) {
             lastLevel = mc.level.dimension();
@@ -234,6 +248,13 @@ public class VistaLevelRenderer {
         int depth = RENDER_STACK.size();
         boolean isOutermost = depth == 0;
 
+        // Capture the framebuffer bound on entry. The feed renders into its own canvas and, on the
+        // outermost pass, does not hand the GL binding back to the caller. Minecraft tracks that
+        // binding through a cache (and shader mods like Iris keep their own copy of it), so a feed
+        // leaving its canvas bound lets the resumed main pass draw into the feed texture instead of
+        // the screen -- the "TV screen turns black once shaders are turned on" report.
+        int previousFramebuffer = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING);
+
         RenderTarget mainTarget = mc.getMainRenderTarget();
         RenderTarget canvas = text.getRenderTarget();
         mc.mainRenderTarget = canvas;
@@ -241,7 +262,7 @@ public class VistaLevelRenderer {
         // A TV resize swaps in a whole new RenderTarget, which Iris's version-counter change detection
         // misses, leaving its gbuffers attached to the old freed canvas. Nudge it manually.
         if (CompatHandler.IRIS) {
-            IrisCompat.onFeedCanvasBound(canvas);
+            IrisCompat.onFeedCanvasBound(canvas, text.getTextureLocation().getPath());
         }
 
         Camera camera = acquireDummyCamera(depth);
@@ -305,6 +326,26 @@ public class VistaLevelRenderer {
             // already wrapped outside; don't double-wrap this or it fucks everything over omg.
             renderLevel(mc, canvas, camera, fov, customProjection);
 
+            if (CompatHandler.IRIS) {
+                int sections = visibleSectionCount(mc.levelRenderer);
+                Integer best = FEED_SECTION_PEAKS.get(canvas);
+                int peak = Math.max(best == null ? 0 : best, sections);
+                FEED_SECTION_PEAKS.put(canvas, peak);
+                // A collapsed render (far fewer sections than this canvas has ever shown) draws only
+                // sky and entities over the previous frame; shaderpack temporal effects then latch
+                // the ghost copies. Reset such frames to flat fog so nothing latches.
+                if (sections >= 0 && peak > 32 && sections < peak / 4) {
+                    VistaMod.LOGGER.warn("[VistaFeed] collapsed feed render ({} of peak {}) - resetting canvas",
+                            sections, peak);
+                    float[] fog = RenderSystem.getShaderFogColor();
+                    RenderSystem.clearColor(fog[0], fog[1], fog[2], 1.0f);
+                    RenderSystem.clear(GL11.GL_COLOR_BUFFER_BIT, ON_OSX);
+                } else if (ClientConfigs.rendersDebug()) {
+                    VistaMod.LOGGER.info("[VistaFeed] post-renderLevel canvas=#{}/{}x{}: sections={}",
+                            System.identityHashCode(canvas), canvas.width, canvas.height, sections);
+                }
+            }
+
             // save updated feed camera state
             feedCameraState.copyFrom(mc.levelRenderer);
 
@@ -336,6 +377,15 @@ public class VistaLevelRenderer {
             if (!isOutermost) {
                 mainTarget.bindWrite(true);
                 RenderSystem.viewport(0, 0, mainTarget.width, mainTarget.height);
+            } else {
+                // By the same logic as the nested case, the outermost feed must hand the main
+                // framebuffer binding back: it rendered into its own canvas and there is nothing
+                // after it to re-bind before the main pass resumes drawing. Shader mods (Iris) keep
+                // their own copy of the bound framebuffer and skip redundant re-binds, so leaving
+                // the canvas bound there makes the world's next draw land in the feed texture (black
+                // TV). Going through the state manager keeps its cached binding in sync with the real
+                // GL state, so the restore cannot be skipped as a cached no-op.
+                GlStateManager._glBindFramebuffer(GL30.GL_FRAMEBUFFER, previousFramebuffer);
             }
 
             mc.gameRenderer.postEffect = oldPostEffect;
@@ -347,6 +397,33 @@ public class VistaLevelRenderer {
     private static Integer calculateRenderDistance(float fov) {
         //TODO: improve
         return ClientConfigs.RENDER_DISTANCE.get();
+    }
+
+    private static int SKIPPED_BUSY_BUILDS;
+    // Highest section count ever seen per feed canvas; a render far below it is a collapse.
+    private static final Map<RenderTarget, Integer> FEED_SECTION_PEAKS = new WeakHashMap<>();
+
+    private static boolean shouldSkipFeedForBuildQueue() {
+        LevelRenderer lr = Minecraft.getInstance().levelRenderer;
+        if (lr == null) return false;
+        if (lr.hasRenderedAllSections()) {
+            SKIPPED_BUSY_BUILDS = 0;
+            return false;
+        }
+        // Shaderpack reloads tear down and rebuild every pipeline, which rebuilds all sections:
+        // the window is long (~10s), and rendering feeds inside it stamps vertex-layout-mismatched
+        // copies of entities into the pack's temporal buffers. Suppress until it settles.
+        return ++SKIPPED_BUSY_BUILDS < 200;
+    }
+
+    // Temporary diagnostics: how many sections Sodium considered visible for this feed render.
+    private static int visibleSectionCount(LevelRenderer lr) {
+        try {
+            Object renderer = lr.getClass().getMethod("sodium$getWorldRenderer").invoke(lr);
+            return (Integer) renderer.getClass().getMethod("getVisibleChunkCount").invoke(renderer);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return -1;
+        }
     }
 
 
@@ -503,9 +580,12 @@ public class VistaLevelRenderer {
         if (!hasCapturedFrustum) {
             boolean smartCulling = minecraft.smartCull;
 
-            // vanilla disables smart culling for spectators inside solid blocks
-            if (isSpectator && clientLevel.getBlockState(cameraBlockPos).isSolidRender(clientLevel, cameraBlockPos)) {
-                //    smartCulling = false;
+            // A feed camera parked inside an opaque section (viewfinder embedded in a wall or
+            // hillside) can't seed the occlusion BFS: nothing propagates out and the feed renders
+            // sky and clouds only. Vanilla only applies this escape hatch to spectators; the dummy
+            // camera is a BlockDisplay, so mirror the rule for it regardless.
+            if (clientLevel.getBlockState(cameraBlockPos).isSolidRender(clientLevel, cameraBlockPos)) {
+                smartCulling = false;
             }
 
             double entityViewScale = Mth.clamp( //TODO: change these
