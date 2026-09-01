@@ -46,7 +46,7 @@ public record RenderSystemState(
         float glintAlpha = RenderSystem.getShaderGlintAlpha();
         float shaderFogStart = RenderSystem.getShaderFogStart();
         float shaderFogEnd = RenderSystem.getShaderFogEnd();
-        float[] shaderFogColor = RenderSystem.getShaderFogColor();
+        float[] shaderFogColor = RenderSystem.getShaderFogColor().clone();
         FogShape shaderFogShape = RenderSystem.getShaderFogShape();
         Vector3f[] lights = RenderSystem.shaderLightDirections.clone();
         float gameTime = RenderSystem.getShaderGameTime();

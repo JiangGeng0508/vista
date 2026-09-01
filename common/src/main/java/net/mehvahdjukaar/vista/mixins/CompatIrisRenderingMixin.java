@@ -25,15 +25,14 @@ public class CompatIrisRenderingMixin {
         return true;
     }
 
-    // The first beginLevelRendering on a fresh pipeline calls allChanged(), releasing every section's
-    // VertexBuffer, which mid-feed tears down the geometry we're drawing. Deferring it to the end of
-    // the outermost feed (IrisCompat.runPendingWorldRebuild) instead of dropping it: the rebuild is
-    // what backfills the pack's block-id data into sections meshed before the pipeline existed, and
-    // without it those sections render untinted until a random block update rebuilds them.
+    // A feed pipeline has the same shaderpack block-id layout as the already active main pipeline.
+    // Calling allChanged() here destroys the main world's section buffers in the middle of an
+    // off-screen pass. The feed then commits an empty frame and stays black while the scheduler
+    // waits for the resulting build queue. The main pipeline owns rebuilds during a pack reload;
+    // suppress this duplicate request for feed-local pipelines.
     @WrapWithCondition(method = "beginLevelRendering", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/LevelRenderer;allChanged()V"))
     private boolean vista$skipFirstFrameAllChanged(LevelRenderer instance) {
         if (IrisCompat.isFeedRendering()) {
-            IrisCompat.scheduleWorldRebuild();
             return false;
         }
         return true;

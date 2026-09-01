@@ -26,7 +26,7 @@ dependencies {
     implementation("com.github.bawnorton.mixinsquared:mixinsquared-forge:${mixin_squared_version}")
 
 
-    modImplementation("curse.maven:supplementaries-412082:8051628")
+    modCompileOnly("curse.maven:supplementaries-412082:8051628")
     modImplementation("curse.maven:quark-243121:7640331")
     modImplementation("curse.maven:zeta-968868:7640154")
 

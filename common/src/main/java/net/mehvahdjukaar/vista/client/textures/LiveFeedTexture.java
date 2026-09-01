@@ -91,7 +91,7 @@ public class LiveFeedTexture extends PerspectiveTexture {
             }
             setDisconnected(false);
 
-            VistaLevelRenderer.render(this, vf);
+            if (!VistaLevelRenderer.render(this, vf)) return;
 
             if (showsTime() || VistaMod.isFunny()) {
                 LocalDateTime now = LocalDateTime.now();
@@ -240,8 +240,10 @@ public class LiveFeedTexture extends PerspectiveTexture {
         bf.endBatch();
 
         RenderSystem.restoreProjectionMatrix();
+        GlStateManager._enableCull();
         oldTarget.bindWrite(true);
     }
+
 
     private static void drawOverlay(LiveFeedTexture target, ResourceLocation overlayTexture) {
         Minecraft mc = Minecraft.getInstance();
@@ -268,6 +270,8 @@ public class LiveFeedTexture extends PerspectiveTexture {
         BufferUploader.draw(bufferBuilder.buildOrThrow());
         shaderInstance.clear();
         GlStateManager._depthMask(true);
+        GlStateManager._enableDepthTest();
+        GlStateManager._disableBlend();
         GlStateManager._colorMask(true, true, true, true);
         oldTarget.bindWrite(true);
     }

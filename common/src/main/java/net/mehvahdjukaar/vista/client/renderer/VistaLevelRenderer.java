@@ -197,8 +197,8 @@ public class VistaLevelRenderer {
         return DUMMY_CAMERA_POOL.get(depth);
     }
 
-    public static void render(PerspectiveTexture text, ViewFinderBlockEntity tile) {
-        render(text, tile, (camera, partialTicks) -> setupSceneCamera(tile, camera, partialTicks),
+    public static boolean render(PerspectiveTexture text, ViewFinderBlockEntity tile) {
+        return render(text, tile, (camera, partialTicks) -> setupSceneCamera(tile, camera, partialTicks),
                 tile.getFOV(), true, null, null, null);
     }
 
@@ -212,7 +212,7 @@ public class VistaLevelRenderer {
      *                               block, so smart culling would propagate "blocked" everywhere
      * @param renderDistanceOverride per-pass chunk render distance, used to attenuate mirror nesting
      */
-    public static void render(PerspectiveTexture text, Object renderingToken,
+    public static boolean render(PerspectiveTexture text, Object renderingToken,
                               SceneCameraSetup cameraSetup, float fov,
                               boolean applyPostChain,
                               @Nullable Matrix4f customProjection,
@@ -220,23 +220,24 @@ public class VistaLevelRenderer {
                               @Nullable Integer renderDistanceOverride) {
         Minecraft mc = Minecraft.getInstance();
 
-        if (mc.level == null) return;
+        if (mc.level == null) return false;
         // While Sodium's section build queue is busy (world join, teleport, new terrain), a feed
         // render sees a half-built world: missing sections leave fog-colored holes and entities
         // stamp ghost copies that the pack's temporal effects then persist. Skip refreshes until
         // the queue drains, keeping the last good frame on the tv; the escape hatch keeps a tv in
         // a permanently-busy area (flowing water etc.) from freezing forever.
-        if (shouldSkipFeedForBuildQueue()) return;
+        if (shouldSkipFeedForBuildQueue()) return false;
         //debounce dimension changing for some reason idk yet
         if (mc.level.dimension() != lastLevel) {
             lastLevel = mc.level.dimension();
-            return;
+            return false;
         }
 
         // Every off-screen level render funnels through here, so compat wrappers go on this call and
         // nowhere else. Each one saves and restores what it stomps, so nesting is fine.
         CompatHandler.decorateRenderer(() -> doRender(mc, text, renderingToken, cameraSetup, fov,
                 applyPostChain, customProjection, bfsStartOverride, renderDistanceOverride)).run();
+        return true;
     }
 
     private static void doRender(Minecraft mc, PerspectiveTexture text, Object renderingToken,
@@ -254,6 +255,8 @@ public class VistaLevelRenderer {
         // leaving its canvas bound lets the resumed main pass draw into the feed texture instead of
         // the screen -- the "TV screen turns black once shaders are turned on" report.
         int previousFramebuffer = GL11.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING);
+        int[] previousViewport = new int[4];
+        GL11.glGetIntegerv(GL11.GL_VIEWPORT, previousViewport);
 
         RenderTarget mainTarget = mc.getMainRenderTarget();
         RenderTarget canvas = text.getRenderTarget();
@@ -387,6 +390,7 @@ public class VistaLevelRenderer {
                 // GL state, so the restore cannot be skipped as a cached no-op.
                 GlStateManager._glBindFramebuffer(GL30.GL_FRAMEBUFFER, previousFramebuffer);
             }
+            RenderSystem.viewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
 
             mc.gameRenderer.postEffect = oldPostEffect;
             mc.gameRenderer.effectActive = wasEffectActive;

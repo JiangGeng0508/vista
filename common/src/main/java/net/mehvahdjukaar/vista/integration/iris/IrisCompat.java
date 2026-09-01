@@ -154,33 +154,35 @@ public class IrisCompat {
         return texturePath;
     }
 
-    // A shared per-size pipeline still alternates between same-size canvases when more than
-    // MAX_FEED_PIPELINES are in view. Its colortex ping-pong buffers hold the pack's temporal state
-    // and are view dependent. Arming Iris's full-clear flag on a canvas switch makes the next
-    // beginLevelRendering clear both halves of every temporal buffer, which is far less visible than
-    // cross-camera ghosting.
+    // Iris's full clear follows the pack's attachment clear colors. In BSL/Bliss that includes a
+    // white gbuffer clear that becomes visible in an off-screen feed after a shaderpack reload.
+    // Each feed repopulates its gbuffers, while clearTemporalHistory resets the few buffers that
+    // legitimately persist between frames, so suppress Iris's feed-local full clear.
+
     public static void onFeedPipelineBound(WorldRenderingPipeline pipeline, RenderTarget canvas) {
         RenderTarget last = LAST_FEED_CANVAS.put(pipeline, canvas);
         if (last != null && last != canvas) {
-            VistaMod.LOGGER.info("[VistaFeed] pipeline canvas switch #{} -> #{}: arming full clear",
+            VistaMod.LOGGER.info("[VistaFeed] pipeline canvas switch #{} -> #{}: clearing temporal buffers",
                     System.identityHashCode(last), System.identityHashCode(canvas));
-            clearTemporalBuffers(pipeline);
+            // The unconditional clear below handles the shared pipeline; this is only diagnostic.
+
         }
         // The feed renders at 10Hz by default, so between two frames a moving entity jumps by a
         // large pixel distance. BSL/Bliss TAA has no per-entity motion vectors; it reprojects only
-        // the camera, so its neighbourhood clamp cannot reject that jump and the TAA history
-        // (colortex5, never cleared by the pack) smears every previous position into the current
-        // frame: moving entities look like a long-exposure photograph. Clearing colortex5 before
-        // each feed render turns the temporal pass into a single-sample resolve -- no trails, at
-        // the cost of some shimmer at low feed FPS. A newly created pipeline already has its
-        // full-clear flag set, so clearing here only matters for cached pipelines.
-        clearTaaHistory(pipeline);
+        // the camera, so its neighbourhood clamp cannot reject that jump and persistent buffers
+        // carry prior camera frames into the current composite. Clearing only the known temporal
+        // buffers before each feed render prevents them from contaminating the next composite.
+
+
+
+        clearTemporalHistory(pipeline);
+        suppressFullClear(pipeline);
     }
 
     // Main render thread only, keyed weakly so pipelines destroyed on a pack reload don't leak.
     private static final Map<WorldRenderingPipeline, RenderTarget> LAST_FEED_CANVAS = new WeakHashMap<>();
 
-    private static void clearTemporalBuffers(WorldRenderingPipeline pipeline) {
+    private static void suppressFullClear(WorldRenderingPipeline pipeline) {
         // Toggling shaderpacks off mid-session makes preparePipeline hand back a bare
         // VanillaRenderingPipeline for the feed dimension, which has no renderTargets field.
         if (!(pipeline instanceof IrisRenderingPipeline)) return;
@@ -188,27 +190,30 @@ public class IrisCompat {
         try {
             Object renderTargets = PIPELINE_RENDER_TARGETS_FIELD.get(pipeline);
             if (renderTargets != null) {
-                FULL_CLEAR_REQUIRED_FIELD.setBoolean(renderTargets, true);
+                FULL_CLEAR_REQUIRED_FIELD.setBoolean(renderTargets, false);
             }
         } catch (ReflectiveOperationException e) {
-            VistaMod.LOGGER.warn("Failed to arm Iris full clear for feed pipeline switch", e);
+            VistaMod.LOGGER.warn("Failed to suppress Iris full clear for feed", e);
         }
     }
 
-    // BSL/Bliss keep their TAA history in colortex5 and deliberately never clear it
-    // (colortex5Clear=false). We clear only that ping-pong pair before every feed render; a full
-    // clear would also wipe the pack's gbuffers (colortex1 clears to white) and can wash the
-    // composite out, which is why the canvas-switch full clear above is only armed on switches.
-    private static void clearTaaHistory(WorldRenderingPipeline pipeline) {
+    // BSL stores TAA/exposure history in colortex2, Bliss uses colortex5, and both retain
+    // colored-light history in colortex9. Clear only these ping-pong pairs: full-clearing the
+    // pack's gbuffers, including colortex1, clears that attachment to white and washes the
+    // composite out, so it is never used for feed pipelines.
+    private static final int[] TEMPORAL_BUFFER_INDICES = {2, 5, 9};
+    private static void clearTemporalHistory(WorldRenderingPipeline pipeline) {
         if (!(pipeline instanceof IrisRenderingPipeline)) return;
         if (PIPELINE_RENDER_TARGETS_FIELD == null) return;
         try {
             Object renderTargets = PIPELINE_RENDER_TARGETS_FIELD.get(pipeline);
             if (renderTargets == null) return;
-            Object taaTarget = renderTargets.getClass().getMethod("get", int.class).invoke(renderTargets, 5);
-            if (taaTarget == null) return;
-            clearIrisTexture(taaTarget, "getMainTexture");
-            clearIrisTexture(taaTarget, "getAltTexture");
+            for (int index : TEMPORAL_BUFFER_INDICES) {
+                Object temporalTarget = renderTargets.getClass().getMethod("get", int.class).invoke(renderTargets, index);
+                if (temporalTarget == null) continue;
+                clearIrisTexture(temporalTarget, "getMainTexture");
+                clearIrisTexture(temporalTarget, "getAltTexture");
+            }
         } catch (ReflectiveOperationException | RuntimeException e) {
             VistaMod.LOGGER.warn("Failed to clear Iris TAA history for feed", e);
         }
@@ -342,7 +347,6 @@ public class IrisCompat {
                 oldState.saveTo(CapturedRenderingState.INSTANCE);
                 setCurrentPipeline(lr, oldLrPipeline);
                 setPipelineManagerPipeline(pm, oldPmPipeline);
-                runPendingWorldRebuild(!oldVistaRendering);
             }
         };
     }
